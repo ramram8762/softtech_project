@@ -1,3 +1,4 @@
+uniface
 deepface
 flask
 opencv-python
