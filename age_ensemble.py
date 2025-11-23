@@ -1,185 +1,257 @@
-"""Age ensemble backend using UniFace only (option 3-1).
+from __future__ import annotations
+"""
+통합 나이/성별 추정 모듈 (UniFace 단독 버전, 서명 + 튜닝 포함).
 
-- DeepFace / TensorFlow는 전혀 사용하지 않는다.
-- UniFace (RetinaFace + AgeGender) + OpenCV만 사용한다.
-- 클라이언트(AgeRunner.js)가 기대하는 JSON 형식을 유지한다.
+- UniFace: RetinaFace + AgeGender 조합 (나이 + 성별, ONNX 기반)
+- DeepFace 는 아예 사용하지 않는다.
+- 응답 JSON 에는 signature 필드를 넣어서
+  서버 코드가 확실히 바뀌었는지 확인 가능하게 한다.
+- 겉보이는 피부 나이는 15~60세 구간에서만 보여 주고,
+  60세 부근에서는 최대 15년 정도 감산하는 방식으로 튜닝한다.
 """
 
-from __future__ import annotations
+from typing import Any, Dict, Optional
 
 import base64
-from typing import Any, Dict, Tuple
-
 import cv2
 import numpy as np
+
 from uniface import RetinaFace, AgeGender
 
-# Lazy-loaded global models (프로세스당 1번만 로드)
-_DETECTOR: RetinaFace | None = None
-_AGE_GENDER: AgeGender | None = None
+
+_DETECTOR: Optional[RetinaFace] = None
+_AGE_GENDER: Optional[AgeGender] = None
 
 
-def _get_models() -> Tuple[RetinaFace, AgeGender]:
-    """Create or reuse UniFace models."""
+def _get_models() -> tuple[RetinaFace, AgeGender]:
+    """RetinaFace / AgeGender 모델을 lazy-init 방식으로 준비한다."""
     global _DETECTOR, _AGE_GENDER
 
     if _DETECTOR is None:
-        _DETECTOR = RetinaFace()  # default: retinaface_mnet_v2
+        _DETECTOR = RetinaFace()
 
     if _AGE_GENDER is None:
-        _AGE_GENDER = AgeGender()  # age_gender.onnx
+        _AGE_GENDER = AgeGender()
 
     return _DETECTOR, _AGE_GENDER
 
 
-def _decode_base64_image(image_b64: str) -> np.ndarray:
-    """Decode base64 string to OpenCV BGR image."""
-    if not image_b64:
-        raise ValueError("Empty base64 string")
-
-    # Strip data URI prefix if present
-    if "," in image_b64 and image_b64.strip().startswith("data:"):
-        image_b64 = image_b64.split(",", 1)[1]
-
+def _decode_base64_to_bgr(image_base64: str) -> Optional[np.ndarray]:
+    """
+    data URL prefix 를 포함한 base64 문자열을 BGR OpenCV 이미지로 변환한다.
+    실패 시 None 을 리턴한다.
+    """
     try:
-        binary = base64.b64decode(image_b64, validate=True)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError("Invalid base64 image") from exc
+        if not image_base64:
+            return None
 
-    nparr = np.frombuffer(binary, dtype=np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Failed to decode image bytes")
-    return img
+        # data URL prefix 제거
+        if image_base64.startswith("data:"):
+            image_base64 = image_base64.split(",", 1)[-1]
+
+        binary = base64.b64decode(image_base64)
+        arr = np.frombuffer(binary, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        return img
+    except Exception:
+        return None
 
 
-def _analyze_uniface(image: np.ndarray) -> Dict[str, Any]:
-    """Run UniFace detector + age/gender model on a BGR image."""
-    detector, age_gender = _get_models()
+def _softmax_2(logits: np.ndarray) -> tuple[float, float]:
+    """길이 2 로짓에 대한 softmax → (p0, p1)."""
+    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
+    if logits.size < 2:
+        return 0.5, 0.5
+    m = float(np.max(logits[:2]))
+    e0 = float(np.exp(logits[0] - m))
+    e1 = float(np.exp(logits[1] - m))
+    s = e0 + e1
+    if s <= 0.0:
+        return 0.5, 0.5
+    return e0 / s, e1 / s
 
-    faces = detector.detect(image) or []
+
+def _predict_uniface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
+    """
+    UniFace (RetinaFace + AgeGender) 로부터
+    단일 얼굴에 대한 나이/성별을 추정한다.
+    """
+    det, ag = _get_models()
+
+    faces = det.detect(bgr, max_num=1)
     if not faces:
         return {
             "ok": False,
-            "error": "NO_FACE",
-            "message": "No face detected in the image.",
+            "error": "UniFace 에서 얼굴을 찾지 못했습니다.",
+            "age": None,
+            "gender_label": None,
+            "gender_scores": None,
+            "bbox": None,
+            "confidence": None,
         }
 
-    # Pick the most confident face (가장 높은 confidence)
-    best = max(faces, key=lambda f: float(f.get("confidence", 0.0)))
+    face0 = faces[0]
+    bbox = None
+    conf = None
 
-    bbox = best.get("bbox") or [0, 0, 0, 0]
-    confidence = float(best.get("confidence", 0.0))
+    if isinstance(face0, dict):
+        bbox = face0.get("bbox") or face0.get("box") or face0.get("bbox_xyxy")
+        conf = face0.get("confidence")
+    elif isinstance(face0, (list, tuple, np.ndarray)):
+        bbox = face0
 
-    # UniFace AgeGender API: gender(str), age(int/float)
-    gender_label, age_value = age_gender.predict(image, bbox)
+    if bbox is None:
+        return {
+            "ok": False,
+            "error": "UniFace 에서 얼굴 bbox 를 해석하지 못했습니다.",
+            "age": None,
+            "gender_label": None,
+            "gender_scores": None,
+            "bbox": None,
+            "confidence": None,
+        }
 
-    # Age
+    bbox_array = np.asarray(bbox, dtype=np.float32).reshape(-1)
+
     try:
-        age_int = int(round(float(age_value)))
-    except Exception:  # noqa: BLE001
-        age_int = int(age_value or 0)
+        blob = ag.preprocess(bgr, bbox_array)
+        raw_out = ag.session.run(ag.output_names, {ag.input_name: blob})[0][0]
+        raw_out = np.asarray(raw_out, dtype=np.float32).reshape(-1)
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"UniFace AgeGender 추론 실패: {e}",
+            "age": None,
+            "gender_label": None,
+            "gender_scores": None,
+            "bbox": bbox_array.tolist(),
+            "confidence": float(conf) if conf is not None else None,
+        }
 
-    # Gender → 확률(score)로 변환 (단순 매핑)
-    g_str = str(gender_label or "").lower()
-    if g_str.startswith("m"):  # "male"
-        man_score = 99.0
-        woman_score = 1.0
-        gender_label_out = "Male"
-    elif g_str.startswith("f"):  # "female"
-        man_score = 1.0
-        woman_score = 99.0
-        gender_label_out = "Female"
-    else:
-        man_score = 50.0
-        woman_score = 50.0
-        gender_label_out = "Unknown"
-
+    gender_label, age_years = ag.postprocess(raw_out)
+    p_female, p_male = _softmax_2(raw_out[:2])
     gender_scores = {
-        "Man": float(man_score),
-        "Woman": float(woman_score),
+        "Woman": float(p_female * 100.0),
+        "Man": float(p_male * 100.0),
     }
 
-    # bbox를 float 리스트로 정규화
-    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
-        x1, y1, x2, y2 = bbox[:4]
-        bbox_list = [float(x1), float(y1), float(x2), float(y2)]
-    else:
-        bbox_list = [0.0, 0.0, 0.0, 0.0]
-
-    result: Dict[str, Any] = {
-        "signature": "SOFTTECH_UNIFACE_ONLY_V3_1",
+    return {
         "ok": True,
         "error": None,
-        "age": age_int,
-        "final_age": age_int,
-        "gender": gender_scores,  # top-level gender scores
-        "ages": {
-            "uniface": age_int,
-        },
-        "models": {
-            "uniface": {
-                "age": age_int,
-                "gender_label": gender_label_out,
-                "gender_scores": gender_scores,
-                "bbox": bbox_list,
-                "confidence": float(confidence),
-            },
-        },
-        "model_count": 1,
-        "model_errors": {
-            # DeepFace는 완전히 제거되었지만, JSON 구조 호환성을 위해 키만 남겨둔다.
-            "deepface": "DISABLED (not installed)",
-            "uniface": None,
-        },
-    }
-    return result
-
-
-def analyze_age_ensemble(image_b64: str) -> Dict[str, Any]:
-    """Public API called from app.py.
-
-    Parameters
-    ----------
-    image_b64 : str
-        Base64-encoded image string (with or without data URI prefix).
-
-    Returns
-    -------
-    Dict[str, Any]
-        JSON-serializable result for the mobile app.
-    """
-    base_result: Dict[str, Any] = {
-        "signature": "SOFTTECH_UNIFACE_ONLY_V3_1",
-        "ok": False,
-        "error": "UNKNOWN",
+        "age": int(age_years),
+        "gender_label": str(gender_label),
+        "gender_scores": gender_scores,
+        "bbox": bbox_array.tolist(),
+        "confidence": float(conf) if conf is not None else None,
     }
 
+
+def _safe_float(x: Any) -> Optional[float]:
+    """넘어온 값을 안전하게 float 로 변환한다. 실패 시 None."""
     try:
-        image = _decode_base64_image(image_b64)
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
-        # 간단한 해상도/품질 체크 (너무 작은 경우)
-        h, w = image.shape[:2]
-        if min(h, w) < 128:
-            base_result.update(
-                {
-                    "ok": False,
-                    "error": "IMAGE_TOO_SMALL",
-                    "message": f"Image too small for stable analysis: {w}x{h}px",
-                }
-            )
-            return base_result
 
-        result = _analyze_uniface(image)
-        base_result.update(result)
-        return base_result
+def _calibrate_visible_age_15_60(raw: Optional[float]) -> Optional[float]:
+    """
+    15~60 범위 내에서만 '겉보이는 피부 나이'를 보여 주기 위한 튜닝 함수.
 
-    except Exception as exc:  # noqa: BLE001
-        base_result.update(
-            {
-                "ok": False,
-                "error": "PIPELINE_ERROR",
-                "message": f"{exc.__class__.__name__}: {exc}",
-            }
-        )
-        return base_result
+    - 입력 나이가 15 미만이면 15로 올려 준다.
+    - 60 초과면 60으로 잘라 준다.
+    - 15~60 구간에서 위로 갈수록 최대 15살까지 조금씩 감소시킨다.
+      (예: 60 → 약 45 부근)
+    """
+    raw_f = _safe_float(raw)
+    if raw_f is None:
+        return None
+
+    # 기본 범위 클리핑
+    if raw_f < 15.0:
+        raw_f = 15.0
+    if raw_f > 60.0:
+        raw_f = 60.0
+
+    # 15~60 구간을 0~1 로 정규화
+    t = (raw_f - 15.0) / 45.0  # 0~1
+    # t 가 커질수록 더 많이 빼 주되, 60 에서 약 15년 정도 빠지도록
+    subtract = 15.0 * (t ** 1.2)  # 지수 1.2 는 완만한 곡선
+    calibrated = raw_f - subtract
+
+    # 안전 범위 보정
+    if calibrated < 15.0:
+        calibrated = 15.0
+    if calibrated > 60.0:
+        calibrated = 60.0
+
+    return calibrated
+
+
+def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
+    """
+    클라이언트에서 보낸 base64 이미지를 받아
+    UniFace 로 나이/성별을 추정한 뒤 JSON 결과로 정리한다.
+    """
+    bgr = _decode_base64_to_bgr(image_base64)
+    if bgr is None:
+        return {
+            "signature": "SOFTTECH_UNIFACE_ONLY_V4",
+            "ok": False,
+            "error": "이미지 디코딩 실패",
+            "age": None,
+            "final_age": None,
+            "gender": None,
+            "ages": {},
+            "models": {},
+            "model_count": 0,
+        }
+
+    uni = _predict_uniface_from_bgr(bgr)
+
+    ages: Dict[str, float] = {}
+    models: Dict[str, Dict[str, Any]] = {}
+
+    if uni.get("ok") and uni.get("age") is not None:
+        ages["uniface"] = float(uni["age"])
+        models["uniface"] = {
+            "age": int(uni["age"]),
+            "gender_label": uni.get("gender_label"),
+            "gender_scores": uni.get("gender_scores"),
+            "bbox": uni.get("bbox"),
+            "confidence": uni.get("confidence"),
+        }
+
+    final_age_raw: Optional[float] = None
+    if ages:
+        vals = list(ages.values())
+        final_age_raw = sum(vals) / max(1, len(vals))
+
+    # ★ 여기서 15~60 범위 튜닝 + 차등 감산 적용
+    final_age = _calibrate_visible_age_15_60(final_age_raw)
+
+    gender_payload: Optional[Dict[str, float]] = None
+    if uni.get("gender_scores"):
+        raw_map = uni["gender_scores"]
+        gender_payload = {str(k): float(v) for k, v in raw_map.items()}
+    elif uni.get("gender_label"):
+        g = str(uni["gender_label"])
+        if g.lower().startswith("m"):
+            gender_payload = {"Man": 100.0, "Woman": 0.0}
+        else:
+            gender_payload = {"Woman": 100.0, "Man": 0.0}
+
+    return {
+        "signature": "SOFTTECH_UNIFACE_ONLY_V4",
+        "ok": _safe_float(final_age) is not None,
+        "age": _safe_float(final_age),
+        "final_age": _safe_float(final_age),
+        "gender": gender_payload,
+        "ages": {k: float(v) for k, v in ages.items()},
+        "models": models,
+        "model_count": len(ages),
+    }
