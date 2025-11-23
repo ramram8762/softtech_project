@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 """
 통합 나이/성별 추정 모듈 (DeepFace + UniFace 앙상블, 디버그용 오류 정보 포함).
