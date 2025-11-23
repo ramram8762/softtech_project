@@ -5,12 +5,14 @@ Age ensemble module.
 - Optionally uses DeepFace (TensorFlow) as a secondary estimator.
 - Returns a unified JSON-serializable dictionary that the React Native client expects.
 
-This module is intentionally self-contained so that app.py only needs to call
+This module is intentionally self‑contained so that app.py only needs to call
 `analyze_age_ensemble(image_bytes: bytes)`.
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -217,7 +219,6 @@ def _run_deepface(image_bgr: np.ndarray) -> Tuple[Dict[str, Any], Optional[str]]
             img_path=image_rgb,
             actions=["age", "gender"],
             enforce_detection=False,
-            prog_bar=False,
         )
 
         if isinstance(analysis, list) and analysis:
