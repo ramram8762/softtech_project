@@ -1,338 +1,337 @@
-from __future__ import annotations
 """
-DeepFace + UniFace 앙상블 모듈 (DeepFace import 에러 노출 버전)
+Age ensemble module.
+
+- Uses UniFace (RetinaFace + AgeGender ONNX models) as the primary estimator.
+- Optionally uses DeepFace (TensorFlow) as a secondary estimator.
+- Returns a unified JSON-serializable dictionary that the React Native client expects.
+
+This module is intentionally self-contained so that app.py only needs to call
+`analyze_age_ensemble(image_bytes: bytes)`.
 """
 
+from __future__ import annotations
+
+import logging
 from typing import Any, Dict, Optional, Tuple
 
-import base64
 import cv2
 import numpy as np
 
-from uniface import RetinaFace, AgeGender
+# These imports will fail if the corresponding packages are not installed.
+# They are wrapped in lazy initialisation so that the server can still run
+# even if one of the models is unavailable.
+try:
+    from uniface import RetinaFace, AgeGender  # type: ignore
+except Exception:  # pragma: no cover - handled lazily
+    RetinaFace = AgeGender = None  # type: ignore
 
-_DETECTOR: Optional[RetinaFace] = None
-_AGE_GENDER: Optional[AgeGender] = None
-
-# DeepFace import 는 lazy 하게, 에러 메시지를 전역에 보관
-_DEEPFACE_OBJ = None
-_DEEPFACE_ERR: Optional[str] = None
-
-
-def _get_uniface_models() -> Tuple[RetinaFace, AgeGender]:
-    global _DETECTOR, _AGE_GENDER
-
-    if _DETECTOR is None:
-        _DETECTOR = RetinaFace()
-
-    if _AGE_GENDER is None:
-        _AGE_GENDER = AgeGender()
-
-    return _DETECTOR, _AGE_GENDER
+try:
+    from deepface import DeepFace  # type: ignore
+except Exception:  # pragma: no cover - handled lazily
+    DeepFace = None  # type: ignore
 
 
-def _decode_base64_to_bgr(image_base64: str) -> Optional[np.ndarray]:
+LOGGER = logging.getLogger("age_ensemble")
+LOGGER.setLevel(logging.INFO)
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+
+def _bytes_to_cv2_image(image_bytes: bytes) -> np.ndarray:
+    """Decode raw image bytes (JPEG/PNG) to an OpenCV BGR image."""
+    np_arr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("이미지 디코딩 실패: 지원되지 않는 형식이거나 손상된 파일입니다.")
+    return img
+
+
+def _normalize_gender_keys(dist: Dict[str, float]) -> Dict[str, float]:
+    """
+    Normalize a raw gender probability dictionary into {'Woman': x, 'Man': y}.
+
+    The input may contain keys like 'Male' / 'Female' / 'man' / 'woman'.
+    Missing keys are filled with 0.0.
+    """
+    woman = 0.0
+    man = 0.0
+
+    for k, v in (dist or {}).items():
+        key = k.lower()
+        try:
+            val = float(v)
+        except Exception:
+            continue
+
+        if key.startswith("f") or key.startswith("w"):  # female / woman
+            woman = max(woman, val)
+        elif key.startswith("m"):  # male / man
+            man = max(man, val)
+
+    # If everything is zero, make it a neutral 50/50.
+    if woman <= 0.0 and man <= 0.0:
+        woman = man = 50.0
+
+    total = woman + man
+    if total <= 0.0:
+        return {"Woman": 50.0, "Man": 50.0}
+
+    return {"Woman": 100.0 * woman / total, "Man": 100.0 * man / total}
+
+
+def _label_to_gender_scores(label: str) -> Dict[str, float]:
+    """Fallback when a model only returns a gender label."""
+    if not label:
+        return {"Woman": 50.0, "Man": 50.0}
+    low = label.lower()
+    if low.startswith("f") or low.startswith("w"):
+        return {"Woman": 99.0, "Man": 1.0}
+    return {"Woman": 1.0, "Man": 99.0}
+
+
+# -----------------------------------------------------------------------------
+# UniFace backend
+# -----------------------------------------------------------------------------
+
+_UNIFACE_DETECTOR: Optional["RetinaFace"] = None
+_UNIFACE_AGE_GENDER: Optional["AgeGender"] = None
+
+
+def _ensure_uniface_loaded() -> None:
+    global _UNIFACE_DETECTOR, _UNIFACE_AGE_GENDER
+
+    if RetinaFace is None or AgeGender is None:
+        raise ImportError("uniface 패키지가 설치되지 않았습니다. requirements.txt 에 'uniface' 를 추가하세요.")
+
+    if _UNIFACE_DETECTOR is None or _UNIFACE_AGE_GENDER is None:
+        LOGGER.info("[UniFace] Initializing RetinaFace + AgeGender models...")
+        _UNIFACE_DETECTOR = RetinaFace()
+        _UNIFACE_AGE_GENDER = AgeGender()
+
+
+def _run_uniface(image_bgr: np.ndarray) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Run UniFace RetinaFace + AgeGender on the given BGR image.
+
+    Returns:
+        (model_result_dict, error_message)
+        If error_message is not None, model_result_dict is empty.
+    """
     try:
-        if not image_base64:
-            return None
-        if image_base64.startswith("data:"):
-            image_base64 = image_base64.split(",", 1)[-1]
-        binary = base64.b64decode(image_base64)
-        arr = np.frombuffer(binary, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        return img
-    except Exception:
-        return None
+        _ensure_uniface_loaded()
+        assert _UNIFACE_DETECTOR is not None
+        assert _UNIFACE_AGE_GENDER is not None
 
+        faces = _UNIFACE_DETECTOR.detect(image_bgr)
+        if not faces:
+            raise RuntimeError("얼굴을 찾지 못했습니다.")
 
-def _softmax_2(logits: np.ndarray) -> Tuple[float, float]:
-    logits = np.asarray(logits, dtype=np.float32).reshape(-1)
-    if logits.size < 2:
-        return 0.5, 0.5
-    m = float(np.max(logits[:2]))
-    e0 = float(np.exp(logits[0] - m))
-    e1 = float(np.exp(logits[1] - m))
-    s = e0 + e1
-    if s <= 0.0:
-        return 0.5, 0.5
-    return e0 / s, e1 / s
+        # Choose the most confident face.
+        best = max(
+            faces,
+            key=lambda f: float(f.get("score") or f.get("confidence") or 0.0),
+        )
 
+        bbox = best.get("bbox") or best.get("box") or best.get("bbox_xyxy")
+        if bbox is None:
+            raise RuntimeError("UniFace 결과에 bbox가 없습니다.")
 
-def _predict_uniface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
-    det, ag = _get_uniface_models()
+        gender_label, age_value = _UNIFACE_AGE_GENDER.predict(image_bgr, bbox)
 
-    faces = det.detect(bgr, max_num=1)
-    if not faces:
-        return {
-            "ok": False,
-            "error": "UniFace 에서 얼굴을 찾지 못했습니다.",
-            "age": None,
-            "gender_label": None,
-            "gender_scores": None,
-            "bbox": None,
-            "confidence": None,
+        gender_scores = _label_to_gender_scores(str(gender_label))
+        model_res: Dict[str, Any] = {
+            "age": float(age_value),
+            "gender_label": str(gender_label),
+            "gender_scores": gender_scores,
+            "bbox": [float(x) for x in bbox],
+            "confidence": float(best.get("score") or best.get("confidence") or 1.0),
         }
-
-    face0 = faces[0]
-    bbox = None
-    conf = None
-
-    if isinstance(face0, dict):
-        bbox = face0.get("bbox") or face0.get("box") or face0.get("bbox_xyxy")
-        conf = face0.get("confidence")
-    elif isinstance(face0, (list, tuple, np.ndarray)):
-        bbox = face0
-
-    if bbox is None:
-        return {
-            "ok": False,
-            "error": "UniFace bbox 포맷 해석 실패",
-            "age": None,
-            "gender_label": None,
-            "gender_scores": None,
-            "bbox": None,
-            "confidence": None,
-        }
-
-    bbox_array = np.asarray(bbox, dtype=np.float32).reshape(-1)
-
-    try:
-        blob = ag.preprocess(bgr, bbox_array)
-        raw_out = ag.session.run(ag.output_names, {ag.input_name: blob})[0][0]
-        raw_out = np.asarray(raw_out, dtype=np.float32).reshape(-1)
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"UniFace AgeGender 추론 실패: {e}",
-            "age": None,
-            "gender_label": None,
-            "gender_scores": None,
-            "bbox": bbox_array.tolist(),
-            "confidence": float(conf) if conf is not None else None,
-        }
-
-    gender_label, age_years = ag.postprocess(raw_out)
-    p_female, p_male = _softmax_2(raw_out[:2])
-    gender_scores = {
-        "Woman": float(p_female * 100.0),
-        "Man": float(p_male * 100.0),
-    }
-
-    return {
-        "ok": True,
-        "error": None,
-        "age": int(age_years),
-        "gender_label": str(gender_label),
-        "gender_scores": gender_scores,
-        "bbox": bbox_array.tolist(),
-        "confidence": float(conf) if conf is not None else None,
-    }
+        return model_res, None
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[UniFace] Error during inference: %s", exc)
+        return {}, f"UniFace error: {exc}"
 
 
-def _get_deepface():
-    global _DEEPFACE_OBJ, _DEEPFACE_ERR
-    if _DEEPFACE_OBJ is not None:
-        return _DEEPFACE_OBJ, _DEEPFACE_ERR
+# -----------------------------------------------------------------------------
+# DeepFace backend
+# -----------------------------------------------------------------------------
 
-    try:
-        from deepface import DeepFace  # type: ignore
-        _DEEPFACE_OBJ = DeepFace
-        _DEEPFACE_ERR = None
-    except Exception as e:
-        _DEEPFACE_OBJ = None
-        _DEEPFACE_ERR = f"DeepFace import error: {e!r}"
-    return _DEEPFACE_OBJ, _DEEPFACE_ERR
+_DEEPFACE_READY: bool = False
+_DEEPFACE_IMPORT_ERROR: Optional[str] = None
 
 
-def _predict_deepface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
-    DeepFace, imp_err = _get_deepface()
+def _ensure_deepface_loaded() -> None:
+    global _DEEPFACE_READY, _DEEPFACE_IMPORT_ERROR
+
+    if _DEEPFACE_READY:
+        return
     if DeepFace is None:
-        return {
-            "ok": False,
-            "error": imp_err or "DeepFace 라이브러리가 서버에 설치되어 있지 않습니다.",
-            "age": None,
-            "gender_label": None,
-            "gender_scores": None,
-            "bbox": None,
-            "confidence": None,
-        }
+        _DEEPFACE_IMPORT_ERROR = "DeepFace import failed (패키지 설치 확인 필요)"
+        raise ImportError(_DEEPFACE_IMPORT_ERROR)
+
+    # Try a trivial call to make sure TensorFlow / tf-keras are consistent.
+    try:
+        # We don't actually run a model here; we just touch the module.
+        _ = DeepFace  # noqa: F841
+        _DEEPFACE_READY = True
+    except Exception as exc:  # noqa: BLE001
+        _DEEPFACE_IMPORT_ERROR = f"DeepFace import error: {exc}"
+        raise
+
+
+def _run_deepface(image_bgr: np.ndarray) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Run DeepFace age+gender analysis on the given BGR image.
+
+    Returns:
+        (model_result_dict, error_message)
+        If error_message is not None, model_result_dict is empty.
+    """
+    try:
+        _ensure_deepface_loaded()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("DeepFace import error: %s", exc)
+        return {}, f"DeepFace import error: {exc}"
+
+    if DeepFace is None:
+        return {}, "DeepFace module not available."
 
     try:
-        obj = DeepFace.analyze(
-            img_path=bgr,
+        # Downscale large images to reduce memory usage.
+        h, w = image_bgr.shape[:2]
+        max_side = max(h, w)
+        if max_side > 800:
+            scale = 800.0 / float(max_side)
+            image_bgr = cv2.resize(
+                image_bgr,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        # DeepFace expects RGB by default.
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        analysis = DeepFace.analyze(
+            img_path=image_rgb,
             actions=["age", "gender"],
             enforce_detection=False,
+            prog_bar=False,
         )
-    except Exception as e:
-        return {
-            "ok": False,
-            "error": f"DeepFace 분석 실패: {e}",
-            "age": None,
-            "gender_label": None,
-            "gender_scores": None,
+
+        if isinstance(analysis, list) and analysis:
+            analysis = analysis[0]
+
+        age_val = float(analysis.get("age", 0.0))
+        gender_dist = analysis.get("gender") or analysis.get("gender_prob") or {}
+        gender_final = _normalize_gender_keys(gender_dist)
+        gender_label = analysis.get("dominant_gender") or (
+            "Woman" if gender_final["Woman"] >= gender_final["Man"] else "Man"
+        )
+
+        model_res: Dict[str, Any] = {
+            "age": age_val,
+            "gender_label": str(gender_label),
+            "gender_scores": gender_final,
             "bbox": None,
-            "confidence": None,
+            "confidence": float(analysis.get("face_confidence") or 1.0),
         }
-
-    if isinstance(obj, list):
-        if not obj:
-            return {
-                "ok": False,
-                "error": "DeepFace 결과가 비어 있습니다.",
-                "age": None,
-                "gender_label": None,
-                "gender_scores": None,
-                "bbox": None,
-                "confidence": None,
-            }
-        result = obj[0]
-    else:
-        result = obj
-
-    age = result.get("age")
-    try:
-        if age is not None:
-            age = int(age)
-    except Exception:
-        age = None
-
-    gender_label = result.get("gender") or result.get("dominant_gender")
-    if gender_label is not None:
-        gender_label = str(gender_label)
-
-    gender_scores = None
-    raw_gender_scores = result.get("gender_scores")
-    if isinstance(raw_gender_scores, dict):
-        gender_scores = {}
-        for k, v in raw_gender_scores.items():
-            try:
-                gender_scores[str(k)] = float(v) * 100.0
-            except Exception:
-                continue
-
-    bbox = result.get("region") or result.get("bbox")
-    if isinstance(bbox, (list, tuple, np.ndarray)):
-        bbox = np.asarray(bbox, dtype=np.float32).reshape(-1).tolist()
-    else:
-        bbox = None
-
-    return {
-        "ok": age is not None,
-        "error": None if age is not None else "DeepFace 에서 나이를 얻지 못했습니다.",
-        "age": age,
-        "gender_label": gender_label,
-        "gender_scores": gender_scores,
-        "bbox": bbox,
-        "confidence": None,
-    }
+        return model_res, None
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[DeepFace] Error during inference: %s", exc)
+        return {}, f"DeepFace error: {exc}"
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+
+SIGNATURE = "SOFTTECH_DEEPFACE_UNIFACE_V1"
 
 
-def _merge_gender(uni: Dict[str, Any], df: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    scores_list = []
-    for src in (uni.get("gender_scores"), df.get("gender_scores")):
-        if isinstance(src, dict) and src:
-            scores_list.append({str(k): float(v) for k, v in src.items()})
+def analyze_age_ensemble(image_bytes: bytes) -> Dict[str, Any]:
+    """
+    Main entry point.
 
-    if scores_list:
-        acc: Dict[str, float] = {}
-        cnt: Dict[str, int] = {}
-        for s in scores_list:
-            for k, v in s.items():
-                acc[k] = acc.get(k, 0.0) + v
-                cnt[k] = cnt.get(k, 0) + 1
-        return {k: acc[k] / max(1, cnt[k]) for k in acc.keys()}
+    Args:
+        image_bytes: Raw JPEG/PNG bytes from the client.
 
-    label = uni.get("gender_label") or df.get("gender_label")
-    if not label:
-        return None
+    Returns:
+        JSON-serializable dictionary with keys:
+          - signature
+          - ok
+          - error
+          - age
+          - final_age
+          - gender {Woman, Man}
+          - ages {model_name: age}
+          - models {model_name: {detail...}}
+          - model_count
+          - model_errors {model_name: error_message_or_None}
+    """
+    image = _bytes_to_cv2_image(image_bytes)
 
-    label_str = str(label).lower()
-    if label_str.startswith("m"):
-        return {"Man": 100.0, "Woman": 0.0}
-    return {"Woman": 100.0, "Man": 0.0}
+    models: Dict[str, Dict[str, Any]] = {}
+    model_errors: Dict[str, Optional[str]] = {}
+    ages: Dict[str, float] = {}
 
+    gender_acc = {"Woman": 0.0, "Man": 0.0}
+    successful_models = 0
 
-def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
-    bgr = _decode_base64_to_bgr(image_base64)
-    if bgr is None:
+    # UniFace
+    uniface_res, uniface_err = _run_uniface(image)
+    model_errors["uniface"] = uniface_err
+    if not uniface_err and uniface_res:
+        models["uniface"] = uniface_res
+        ages["uniface"] = float(uniface_res["age"])
+        gender = uniface_res["gender_scores"]
+        gender_acc["Woman"] += float(gender.get("Woman", 0.0))
+        gender_acc["Man"] += float(gender.get("Man", 0.0))
+        successful_models += 1
+
+    # DeepFace
+    deepface_res, deepface_err = _run_deepface(image)
+    model_errors["deepface"] = deepface_err
+    if not deepface_err and deepface_res:
+        models["deepface"] = deepface_res
+        ages["deepface"] = float(deepface_res["age"])
+        gender = deepface_res["gender_scores"]
+        gender_acc["Woman"] += float(gender.get("Woman", 0.0))
+        gender_acc["Man"] += float(gender.get("Man", 0.0))
+        successful_models += 1
+
+    if successful_models == 0:
+        # No model succeeded: return a graceful error payload.
         return {
-            "signature": "SOFTTECH_DEEPFACE_UNIFACE_V1",
+            "signature": SIGNATURE,
             "ok": False,
-            "error": "이미지 디코딩 실패",
+            "error": "No model could estimate age / gender (모델 추론 실패)",
             "age": None,
             "final_age": None,
-            "gender": None,
+            "gender": {"Woman": 50.0, "Man": 50.0},
             "ages": {},
             "models": {},
             "model_count": 0,
-            "model_errors": {"uniface": "decode_failed", "deepface": "decode_failed"},
+            "model_errors": model_errors,
         }
 
-    uni = _predict_uniface_from_bgr(bgr)
-    df = _predict_deepface_from_bgr(bgr)
-
-    ages: Dict[str, float] = {}
-    models: Dict[str, Dict[str, Any]] = {}
-    model_errors: Dict[str, Optional[str]] = {}
-
-    if uni.get("ok") and uni.get("age") is not None:
-        ages["uniface"] = float(uni["age"])
-        models["uniface"] = {
-            "age": int(uni["age"]),
-            "gender_label": uni.get("gender_label"),
-            "gender_scores": uni.get("gender_scores"),
-            "bbox": uni.get("bbox"),
-            "confidence": uni.get("confidence"),
-        }
-        model_errors["uniface"] = None
-    else:
-        model_errors["uniface"] = uni.get("error") or "unknown"
-
-    if df.get("ok") and df.get("age") is not None:
-        ages["deepface"] = float(df["age"])
-        models["deepface"] = {
-            "age": int(df["age"]),
-            "gender_label": df.get("gender_label"),
-            "gender_scores": df.get("gender_scores"),
-            "bbox": df.get("bbox"),
-            "confidence": df.get("confidence"),
-        }
-        model_errors["deepface"] = None
-    else:
-        model_errors["deepface"] = df.get("error") or "unknown"
-
-    final_age: Optional[float] = None
-    if ages:
-        vals = list(ages.values())
-        final_age = sum(vals) / max(1, len(vals))
-
-    gender_payload = _merge_gender(uni, df)
-
-    global_ok = _safe_float(final_age) is not None
-
-    if model_errors.get("deepface"):
-        print(">> DeepFace error:", model_errors["deepface"], flush=True)
+    # Aggregate final age and gender.
+    final_age = float(sum(ages.values()) / float(len(ages)))
+    gender = {
+        "Woman": float(gender_acc["Woman"] / successful_models),
+        "Man": float(gender_acc["Man"] / successful_models),
+    }
 
     return {
-        "signature": "SOFTTECH_DEEPFACE_UNIFACE_V1",
-        "ok": global_ok,
-        "error": None if global_ok else "모든 모델에서 나이 추론 실패",
-        "age": _safe_float(final_age),
-        "final_age": _safe_float(final_age),
-        "gender": gender_payload,
-        "ages": {k: float(v) for k, v in ages.items()},
+        "signature": SIGNATURE,
+        "ok": True,
+        "error": None,
+        "age": final_age,
+        "final_age": final_age,
+        "gender": gender,
+        "ages": ages,
         "models": models,
-        "model_count": len(ages),
+        "model_count": successful_models,
         "model_errors": model_errors,
     }
