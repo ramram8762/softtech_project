@@ -1,7 +1,8 @@
-uniface
-deepface
 flask
-opencv-python
+gunicorn
+deepface==0.0.95
+uniface
+opencv-python-headless
 numpy
-tensorflow-cpu
+Pillow
 tf-keras
