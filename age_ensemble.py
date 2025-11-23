@@ -1,11 +1,6 @@
 from __future__ import annotations
 """
-통합 나이/성별 추정 모듈 (DeepFace + UniFace 앙상블, 디버그용 오류 정보 포함).
-
-- UniFace: RetinaFace + AgeGender (나이 + 성별, ONNX 기반)
-- DeepFace: deepface 라이브러리의 age / gender 분석
-- 가능한 경우 두 모델의 나이를 평균내서 최종 나이를 만든다.
-- 각 모델별 성공/실패 사유를 model_errors 로 함께 반환한다.
+DeepFace + UniFace 앙상블 모듈 (DeepFace import 에러 노출 버전)
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -16,19 +11,15 @@ import numpy as np
 
 from uniface import RetinaFace, AgeGender
 
-# DeepFace 는 선택적
-try:  # pragma: no cover
-    from deepface import DeepFace  # type: ignore
-except Exception:  # pragma: no cover
-    DeepFace = None  # type: ignore
-
-
 _DETECTOR: Optional[RetinaFace] = None
 _AGE_GENDER: Optional[AgeGender] = None
 
+# DeepFace import 는 lazy 하게, 에러 메시지를 전역에 보관
+_DEEPFACE_OBJ = None
+_DEEPFACE_ERR: Optional[str] = None
+
 
 def _get_uniface_models() -> Tuple[RetinaFace, AgeGender]:
-    """RetinaFace / AgeGender 모델을 lazy-init."""
     global _DETECTOR, _AGE_GENDER
 
     if _DETECTOR is None:
@@ -41,14 +32,11 @@ def _get_uniface_models() -> Tuple[RetinaFace, AgeGender]:
 
 
 def _decode_base64_to_bgr(image_base64: str) -> Optional[np.ndarray]:
-    """data URL prefix 를 포함한 base64 → BGR 이미지. 실패시 None."""
     try:
         if not image_base64:
             return None
-
         if image_base64.startswith("data:"):
             image_base64 = image_base64.split(",", 1)[-1]
-
         binary = base64.b64decode(image_base64)
         arr = np.frombuffer(binary, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -60,7 +48,6 @@ def _decode_base64_to_bgr(image_base64: str) -> Optional[np.ndarray]:
 
 
 def _softmax_2(logits: np.ndarray) -> Tuple[float, float]:
-    """길이 2 로짓에 대한 softmax → (p0, p1)."""
     logits = np.asarray(logits, dtype=np.float32).reshape(-1)
     if logits.size < 2:
         return 0.5, 0.5
@@ -74,7 +61,6 @@ def _softmax_2(logits: np.ndarray) -> Tuple[float, float]:
 
 
 def _predict_uniface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
-    """UniFace 로 단일 얼굴 나이/성별 추정."""
     det, ag = _get_uniface_models()
 
     faces = det.detect(bgr, max_num=1)
@@ -145,12 +131,27 @@ def _predict_uniface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def _get_deepface():
+    global _DEEPFACE_OBJ, _DEEPFACE_ERR
+    if _DEEPFACE_OBJ is not None:
+        return _DEEPFACE_OBJ, _DEEPFACE_ERR
+
+    try:
+        from deepface import DeepFace  # type: ignore
+        _DEEPFACE_OBJ = DeepFace
+        _DEEPFACE_ERR = None
+    except Exception as e:
+        _DEEPFACE_OBJ = None
+        _DEEPFACE_ERR = f"DeepFace import error: {e!r}"
+    return _DEEPFACE_OBJ, _DEEPFACE_ERR
+
+
 def _predict_deepface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
-    """DeepFace 로 단일 얼굴 나이/성별 추정. 실패해도 전체 파이프라인은 UniFace 단독으로 유지."""
+    DeepFace, imp_err = _get_deepface()
     if DeepFace is None:
         return {
             "ok": False,
-            "error": "DeepFace 라이브러리가 서버에 설치되어 있지 않습니다.",
+            "error": imp_err or "DeepFace 라이브러리가 서버에 설치되어 있지 않습니다.",
             "age": None,
             "gender_label": None,
             "gender_scores": None,
@@ -229,7 +230,6 @@ def _predict_deepface_from_bgr(bgr: np.ndarray) -> Dict[str, Any]:
 
 
 def _safe_float(x: Any) -> Optional[float]:
-    """넘어온 값을 안전하게 float 로 변환. 실패 시 None."""
     try:
         if x is None:
             return None
@@ -239,10 +239,6 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _merge_gender(uni: Dict[str, Any], df: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """
-    UniFace / DeepFace gender 정보를 합쳐 최종 gender 확률 맵 생성.
-    둘 중 하나만 있으면 그대로 사용, 둘 다 있으면 평균.
-    """
     scores_list = []
     for src in (uni.get("gender_scores"), df.get("gender_scores")):
         if isinstance(src, dict) and src:
@@ -255,8 +251,7 @@ def _merge_gender(uni: Dict[str, Any], df: Dict[str, Any]) -> Optional[Dict[str,
             for k, v in s.items():
                 acc[k] = acc.get(k, 0.0) + v
                 cnt[k] = cnt.get(k, 0) + 1
-        merged = {k: acc[k] / max(1, cnt[k]) for k in acc.keys()}
-        return merged
+        return {k: acc[k] / max(1, cnt[k]) for k in acc.keys()}
 
     label = uni.get("gender_label") or df.get("gender_label")
     if not label:
@@ -269,10 +264,6 @@ def _merge_gender(uni: Dict[str, Any], df: Dict[str, Any]) -> Optional[Dict[str,
 
 
 def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
-    """
-    base64 이미지를 받아 UniFace + DeepFace 로 나이/성별 추정 후 JSON 반환.
-    각 모델별 오류는 model_errors 에 담아서 돌려준다.
-    """
     bgr = _decode_base64_to_bgr(image_base64)
     if bgr is None:
         return {
@@ -295,7 +286,6 @@ def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
     models: Dict[str, Dict[str, Any]] = {}
     model_errors: Dict[str, Optional[str]] = {}
 
-    # UniFace 반영
     if uni.get("ok") and uni.get("age") is not None:
         ages["uniface"] = float(uni["age"])
         models["uniface"] = {
@@ -309,7 +299,6 @@ def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
     else:
         model_errors["uniface"] = uni.get("error") or "unknown"
 
-    # DeepFace 반영
     if df.get("ok") and df.get("age") is not None:
         ages["deepface"] = float(df["age"])
         models["deepface"] = {
@@ -323,7 +312,6 @@ def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
     else:
         model_errors["deepface"] = df.get("error") or "unknown"
 
-    # 최종 나이 계산 (가능한 모델 평균)
     final_age: Optional[float] = None
     if ages:
         vals = list(ages.values())
@@ -333,7 +321,6 @@ def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
 
     global_ok = _safe_float(final_age) is not None
 
-    # DeepFace 오류 로그를 stdout 에도 남겨서 Render 로그에서 바로 확인 가능
     if model_errors.get("deepface"):
         print(">> DeepFace error:", model_errors["deepface"], flush=True)
 
