@@ -1,93 +1,67 @@
-"""
-SoftTech Age Ensemble API (clean version)
-
-- Flask app exposing:
-    GET  /              -> health check
-    POST /age-ensemble  -> age + gender estimation
-
-The React Native app sends JSON like:
-    { "image_base64": "data:image/jpeg;base64,AAAA..." }
-
-This server:
-  1) Strips the "data:image/..;base64," prefix if present.
-  2) Decodes the base64 into raw bytes.
-  3) Passes the bytes to analyze_age_ensemble in age_ensemble.py.
-"""
-
-from __future__ import annotations
-
-import base64
-import logging
-from typing import Any, Dict, Optional
-
-from flask import Flask, jsonify, request
-
-from age_ensemble import analyze_age_ensemble, SIGNATURE
-
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger("softtech_app")
+import os
+from flask import Flask, request, jsonify
+from age_ensemble import analyze_age_ensemble
 
 app = Flask(__name__)
 
 
-def _extract_image_bytes_from_request() -> bytes:
-    """
-    Support both:
-      1) JSON: { "image_base64": "data:image/jpeg;base64,..." }
-      2) multipart/form-data: file field named 'image' or 'file'
-    """
-    # 1) JSON body
-    if request.is_json:
-        data: Dict[str, Any] = request.get_json(silent=True) or {}
-        image_b64: Optional[str] = (
-            data.get("image_base64")
-            or data.get("image")
-            or data.get("photo")
-        )
-        if not image_b64:
-            raise ValueError("JSON body에 'image_base64' (또는 'image' / 'photo') 필드가 없습니다.")
-
-        # Strip data URL prefix if present.
-        if "," in image_b64:
-            image_b64 = image_b64.split(",", 1)[1]
-
-        try:
-            return base64.b64decode(image_b64, validate=True)
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"base64 디코딩 실패: {exc}") from exc
-
-    # 2) multipart/form-data
-    if request.files:
-        file = request.files.get("image") or request.files.get("file")
-        if not file:
-            raise ValueError("multipart/form-data 에서 'image' 또는 'file' 필드를 찾을 수 없습니다.")
-        return file.read()
-
-    raise ValueError("지원되지 않는 요청 형식입니다. JSON 또는 multipart/form-data 를 사용하세요.")
-
-
 @app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({"ok": True, "service": "softtech-age-ensemble", "signature": SIGNATURE})
+def index():
+    """Health check endpoint."""
+    return jsonify(
+        {
+            "ok": True,
+            "service": "SoftTech Age Ensemble API",
+            "version": "3-1-uniface-opencv",
+        }
+    )
 
 
 @app.route("/age-ensemble", methods=["POST"])
 def age_ensemble_endpoint():
-    LOGGER.info(">> /age-ensemble called")
+    """Main age estimation endpoint.
+
+    Expected body (JSON):
+        { "image_base64": "<base64 string>" }
+
+    Also supports multipart/form-data with 'image' file field.
+    """
     try:
-        image_bytes = _extract_image_bytes_from_request()
-        result = analyze_age_ensemble(image_bytes)
-        LOGGER.info(">> /age-ensemble result: %s", result)
-        status = 200 if result.get("ok") else 500
+        # 1) Try JSON body first
+        data = request.get_json(silent=True) or {}
+        image_b64 = data.get("image_base64") or data.get("image_b64")
+
+        # 2) Fallback: multipart/form-data file upload
+        if not image_b64 and "image" in request.files:
+            import base64
+
+            upload = request.files["image"]
+            raw = upload.read()
+            image_b64 = base64.b64encode(raw).decode("utf-8")
+
+        if not image_b64:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "NO_IMAGE",
+                        "message": "No image provided. Expected JSON 'image_base64' or multipart file 'image'.",
+                    }
+                ),
+                400,
+            )
+
+        result = analyze_age_ensemble(image_b64)
+        status = 200 if result.get("ok", False) else 500
         return jsonify(result), status
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Error in /age-ensemble: %s", exc)
+
+    except Exception as e:  # noqa: BLE001
         return (
             jsonify(
                 {
-                    "signature": SIGNATURE,
                     "ok": False,
-                    "error": str(exc),
+                    "error": "SERVER_ERROR",
+                    "message": f"{e.__class__.__name__}: {e}",
                 }
             ),
             500,
@@ -95,5 +69,5 @@ def age_ensemble_endpoint():
 
 
 if __name__ == "__main__":
-    # For local debugging only. On Render we use gunicorn.
-    app.run(host="0.0.0.0", port=10000, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
