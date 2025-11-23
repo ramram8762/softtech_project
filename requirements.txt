@@ -1,6 +1,5 @@
+deepface
 flask
-gunicorn
-uniface==1.1.0
-onnxruntime
-opencv-python-headless
+opencv-python
 numpy
+tensorflow-cpu
