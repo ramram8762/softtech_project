@@ -1,7 +1,5 @@
 flask
 gunicorn
-deepface==0.0.95
-opencv-python-headless
+opencv-python
 numpy
-Pillow
-tf-keras
+uniface
