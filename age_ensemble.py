@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 """
-SoftTech 통합 나이 분석 모듈 (age_googlenet 전용 버전)
+SoftTech 통합 나이 분석 모듈 (연령대 전용 버전)
 
-- DeepFace / UniFace 완전 제거
-- age_googlenet.onnx(ONNX Runtime) 결과만 사용
-- 모바일 앱에서는 이 모듈의 analyze_age_ensemble() 만 호출하면 됨
+- DeepFace / UniFace / genderage 완전 제거
+- age_googlenet.onnx 의 "연령대 그룹" 정보만 래핑
+- 성별 정보 완전 제거
 """
 
 from typing import Any, Dict
@@ -13,17 +13,7 @@ from typing import Any, Dict
 from age_onnx import predict_age_onnx
 
 
-SIGNATURE = "SOFTTECH_AGE_GOOGLENET_ONLY_V1"
-
-
-def _safe_int(x: Any) -> int | None:
-    try:
-        v = float(x)
-        if v != v:  # NaN 체크
-            return None
-        return int(round(v))
-    except Exception:
-        return None
+SIGNATURE = "SOFTTECH_AGE_GOOGLENET_GROUPS_V1"
 
 
 def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
@@ -36,70 +26,31 @@ def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
     출력(JSON dict 예시):
         {
             "ok": true,
-            "signature": "SOFTTECH_AGE_GOOGLENET_ONLY_V1",
-            "age": 32,
-            "final_age": 32,
-            "age_raw": 31.7,
-            "ages": {
-                "age_googlenet": 32
-            },
-            "models": {
-                "age_googlenet": {
-                    "age_raw": 31.7
-                }
-            },
-            "model_count": 1,
-            "gender": {
-                "Man": 50.0,
-                "Woman": 50.0
-            }
+            "signature": "SOFTTECH_AGE_GOOGLENET_GROUPS_V1",
+            "provider": "age_googlenet",
+            "num_groups": 8,
+            "group_index": 3,
+            "group_probs": [...],
+            "group_logits": [...]
         }
+
+    ※ 나이(정수/실수), 성별, 우리쪽 보정 수식 전부 포함하지 않음.
     """
-    # ONNX 쪽에 위임
-    onnx_result = predict_age_onnx(image_base64)
+    base = predict_age_onnx(image_base64)
 
-    if not isinstance(onnx_result, dict) or not onnx_result.get("ok"):
-        # ONNX 쪽에서 에러 난 경우, 그대로 ok:false 로 전달
+    if not isinstance(base, dict) or not base.get("ok"):
         return {
             "ok": False,
             "signature": SIGNATURE,
-            "error": onnx_result.get("error") if isinstance(onnx_result, dict) else "ONNX_ERROR",
+            "error": base.get("error") if isinstance(base, dict) else "ONNX_ERROR",
         }
-
-    age_raw = onnx_result.get("age_raw")
-    age_int = _safe_int(age_raw)
-
-    if age_int is None:
-        return {
-            "ok": False,
-            "signature": SIGNATURE,
-            "error": "AGE_PARSE_ERROR",
-        }
-
-    # 앱 호환을 위해 예전 구조 유지
-    ages = {
-        "age_googlenet": age_int,
-    }
-    models = {
-        "age_googlenet": {
-            "age_raw": float(age_raw),
-        }
-    }
-
-    # 성별은 이 버전에서 추정하지 않으므로, 중립값으로 고정
-    gender_payload = {
-        "Man": 50.0,
-        "Woman": 50.0,
-    }
 
     return {
         "ok": True,
         "signature": SIGNATURE,
-        "age": age_int,
-        "final_age": age_int,
-        "age_raw": float(age_raw),
-        "ages": ages,
-        "models": models,
-        "model_count": len(ages),
-        "gender": gender_payload,
+        "provider": base.get("provider", "age_googlenet"),
+        "num_groups": base.get("num_groups"),
+        "group_index": base.get("group_index"),
+        "group_probs": base.get("group_probs"),
+        "group_logits": base.get("group_logits"),
     }
