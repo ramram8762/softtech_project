@@ -24,7 +24,12 @@ _INPUT_SHAPE: Tuple[int, int, int, int] | None = None
 
 
 def _resolve_model_path(model_path: str | None = None) -> str:
-    """실제 존재하는 ONNX 모델 파일 경로를 찾는다."""
+    """
+    실제 존재하는 ONNX 모델 파일 경로를 찾는다.
+    - 1) 함수 인자
+    - 2) 환경변수 AGE_ONNX_MODEL_PATH (strip() 적용)
+    - 3) age_onnx.py 기준 상대 경로들
+    """
     candidates: list[Path] = []
 
     # 1) 함수 인자로 받은 경로
@@ -66,7 +71,8 @@ def _init_session(model_path: str | None = None) -> None:
 
     if cv2 is None:
         raise RuntimeError(
-            "opencv-python-headless(cv2) 가 설치되어 있지 않습니다. requirements.txt 에 opencv-python-headless 를 포함하세요."
+            "opencv-python-headless(cv2) 가 설치되어 있지 않습니다. "
+            "requirements.txt 에 opencv-python-headless 를 포함하세요."
         )
 
     resolved = _resolve_model_path(model_path)
@@ -104,7 +110,19 @@ def _preprocess(img: np.ndarray) -> np.ndarray:
 
 
 def predict_age_onnx(image_b64: str) -> Dict[str, Any]:
-    """age_googlenet.onnx 를 사용하여 근사 나이를 추정한다."""
+    """
+    age_googlenet.onnx 를 사용하여 '연령대 그룹' 정보만 반환한다.
+
+    반환 예시:
+    {
+        "ok": true,
+        "provider": "age_googlenet",
+        "num_groups": 8,
+        "group_index": 3,          # argmax index
+        "group_probs": [...],      # softmax 확률
+        "group_logits": [...],     # 원래 출력 (선택)
+    }
+    """
     try:
         _init_session()
     except Exception as e:
@@ -120,17 +138,23 @@ def predict_age_onnx(image_b64: str) -> Dict[str, Any]:
         img = _decode_image(image_b64)
         inp = _preprocess(img)
         outputs = _SESSION.run(None, {_INPUT_NAME: inp})
-        logits = outputs[0]
-        probs = logits[0].astype(np.float64)
-        probs = probs / probs.sum()
-        ages = np.arange(probs.shape[0], dtype=np.float64)
-        age_pred = float((probs * ages).sum())
+        logits = outputs[0][0].astype(np.float64)  # (num_groups,)
+
+        # softmax
+        shifted = logits - logits.max()
+        exps = np.exp(shifted)
+        probs = exps / exps.sum()
+
+        group_index = int(probs.argmax())
+        num_groups = int(probs.shape[0])
+
         return {
             "ok": True,
-            "age_raw": age_pred,
-            "details": {
-                "probs": probs.tolist(),
-            },
+            "provider": "age_googlenet",
+            "num_groups": num_groups,
+            "group_index": group_index,
+            "group_probs": probs.tolist(),
+            "group_logits": logits.tolist(),
         }
     except Exception as e:
         return {
