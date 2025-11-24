@@ -1,207 +1,87 @@
-from __future__ import annotations
-
-"""
-age_onnx.py
-
-- age_googlenet.onnx ONNX 모델을 직접 불러서
-  얼굴 나이(대략적인 연령)를 추정하는 모듈.
-- DeepFace / UniFace 전혀 사용하지 않는다.
-"""
-
-from typing import Any, Dict, Tuple
-
-import base64
-import logging
 import os
+from flask import Flask, request, jsonify
+from age_ensemble import analyze_age_ensemble
 
-import numpy as np
-
-try:
-    import cv2  # type: ignore[import]
-except Exception:  # noqa: BLE001
-    cv2 = None  # type: ignore[assignment]
-
-try:
-    import onnxruntime as ort  # type: ignore[import]
-except Exception:  # noqa: BLE001
-    ort = None  # type: ignore[assignment]
-
-LOGGER = logging.getLogger("softtech_age_onnx")
-
-_SESSION: "ort.InferenceSession | None" = None  # type: ignore[name-defined]
-_INPUT_NAME: str | None = None
-_INPUT_SHAPE: Tuple[int, ...] | None = None
+# Flask WSGI application 객체 이름은 반드시 "app" 이어야 함
+# (Render Start Command: gunicorn app:app)
+app = Flask(__name__)
 
 
-def _get_model_path() -> str:
+@app.route("/", methods=["GET"])
+def index() -> "flask.Response":
     """
-    ONNX 모델 경로를 결정한다.
-
-    우선순위:
-      1) 환경변수 AGE_ONNX_MODEL_PATH (파일이 실제 존재할 때만)
-      2) 현재 파일 기준 상대 경로:
-         - models/age_googlenet.onnx
-         - models/age_gender_zoo/age_googlenet.onnx
+    헬스 체크 + 버전 확인용 엔드포인트.
     """
-    candidates = []
-
-    env_path = os.getenv("AGE_ONNX_MODEL_PATH")
-    if env_path:
-        # 절대 경로면 그대로, 상대 경로면 이 파일 기준으로 해석
-        if os.path.isabs(env_path):
-            candidates.append(env_path)
-        else:
-            base_dir = os.path.dirname(__file__)
-            candidates.append(os.path.join(base_dir, env_path))
-
-    base_dir = os.path.dirname(__file__)
-    candidates.append(os.path.join(base_dir, "models", "age_googlenet.onnx"))
-    candidates.append(os.path.join(base_dir, "models", "age_gender_zoo", "age_googlenet.onnx"))
-
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-
-    # 하나도 없으면 후보 목록을 함께 에러로 올려준다.
-    raise FileNotFoundError("ONNX 모델 파일을 찾을 수 없습니다. 시도한 경로들: " + " | ".join(candidates))
+    return jsonify(
+        {
+            "ok": True,
+            "service": "SoftTech AgeGoogLeNet Age API",
+            "version": "4-0-age_googlenet-only",
+        }
+    )
 
 
-def _init_session() -> None:
+@app.route("/age-ensemble", methods=["POST"])
+def age_ensemble_route() -> "flask.Response":
     """
-    ONNX Runtime 세션을 1회 초기화.
+    클라이언트에서 base64 이미지를 받아 나이 추정 결과를 반환한다.
+
+    요청 형식 (JSON 또는 form-data):
+    - { "image": "<base64 문자열>" }
+    - 또는 { "image_base64": "<base64 문자열>" }
     """
-    global _SESSION, _INPUT_NAME, _INPUT_SHAPE
-
-    if _SESSION is not None:
-        return
-
-    if ort is None:
-        raise RuntimeError("onnxruntime 이 설치되어 있지 않습니다.")
-
-    if cv2 is None:
-        raise RuntimeError("opencv-python(cv2) 가 설치되어 있지 않습니다.")
-
-    model_path = _get_model_path()
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"ONNX 모델 파일을 찾을 수 없습니다: {model_path}")
-
-    LOGGER.info("Loading ONNX model from %s", model_path)
-    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-    _SESSION = sess
-
-    first_input = sess.get_inputs()[0]
-    _INPUT_NAME = first_input.name
-    # 보통 [1, 3, 224, 224] 형태
-    shape = tuple(int(x) if isinstance(x, (int, float)) else -1 for x in first_input.shape)
-    _INPUT_SHAPE = shape  # type: ignore[assignment]
-
-    LOGGER.info("ONNX model input name=%s shape=%s", _INPUT_NAME, _INPUT_SHAPE)
-
-
-def _preprocess_bgr(bgr: "np.ndarray") -> "np.ndarray":  # type: ignore[name-defined]
-    """
-    age_googlenet.onnx 에 맞게 BGR 이미지를 전처리한다.
-
-    - 입력: BGR, uint8, HxWx3
-    - 처리:
-        - 입력 크기 → 모델 입력 크기로 resize
-        - float32 변환
-        - 평균 [104, 117, 123] (BGR) 을 빼고
-        - CHW 로 transpose 후 배치 차원 추가
-    """
-    if _INPUT_SHAPE is None:
-        # 기본값 (1, 3, 224, 224)
-        h, w = 224, 224
-    else:
-        # (N, C, H, W)
-        shape = _INPUT_SHAPE
-        h = int(shape[2]) if len(shape) >= 3 and shape[2] > 0 else 224
-        w = int(shape[3]) if len(shape) >= 4 and shape[3] > 0 else 224
-
-    resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-    arr = resized.astype("float32")
-    mean = np.array([104.0, 117.0, 123.0], dtype="float32")
-    arr -= mean
-    # HWC -> CHW
-    chw = np.transpose(arr, (2, 0, 1))
-    # 배치 차원 추가
-    batched = np.expand_dims(chw, axis=0)
-    return batched
-
-
-def _softmax(logits: "np.ndarray") -> "np.ndarray":  # type: ignore[name-defined]
-    """
-    단순 softmax 구현.
-    """
-    logits = logits.astype("float32")
-    logits = logits - np.max(logits, axis=-1, keepdims=True)
-    exps = np.exp(logits)
-    sums = np.sum(exps, axis=-1, keepdims=True)
-    return exps / np.maximum(sums, 1e-8)
-
-
-def predict_age_from_bgr(bgr: "np.ndarray") -> Tuple[float, Dict[str, Any]]:  # type: ignore[name-defined]
-    """
-    BGR 이미지를 받아서 연령을 추정한다.
-
-    반환:
-      (age_years, extra_info)
-    """
-    _init_session()
-    assert _SESSION is not None
-    assert _INPUT_NAME is not None
-
-    inp = _preprocess_bgr(bgr)
-    outputs = _SESSION.run(None, {_INPUT_NAME: inp})
-
-    if not outputs:
-        raise RuntimeError("ONNX 모델 출력이 비어 있습니다.")
-
-    logits = outputs[0]
-    # 보통 (1, 101) 형태
-    logits = np.array(logits).reshape(1, -1)
-    probs = _softmax(logits)[0]
-
-    ages = np.arange(probs.shape[0], dtype="float32")
-    age_value = float(np.sum(probs * ages))
-
-    extra = {
-        "probs": probs.tolist(),
-        "age_labels": ages.tolist(),
-    }
-    return age_value, extra
-
-
-def decode_base64_to_bgr(image_base64: str) -> "np.ndarray":  # type: ignore[name-defined]
-    """
-    base64 → BGR (OpenCV) 이미지로 변환.
-    """
-    if cv2 is None:
-        raise RuntimeError("opencv-python(cv2) 가 설치되어 있지 않습니다.")
-
     try:
-        raw = base64.b64decode(image_base64, validate=True)
-    except Exception as e:  # noqa: BLE001
-        raise ValueError(f"BASE64_DECODE_ERROR: {e}") from e
+        # JSON 우선
+        data = request.get_json(silent=True) or {}
+        image_b64 = (
+            data.get("image")
+            or data.get("image_base64")
+            or request.form.get("image")
+            or request.form.get("image_base64")
+        )
 
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("IMAGE_DECODE_ERROR: cv2.imdecode 실패")
-    return img
+        if not image_b64:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "NO_IMAGE",
+                        "message": "image 또는 image_base64 필드가 필요합니다.",
+                    }
+                ),
+                200,
+            )
+
+        result = analyze_age_ensemble(image_b64)
+
+        # 항상 200으로 응답하고, 클라이언트는 result["ok"] 로 성공/실패 판단
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "error": "INVALID_RESULT",
+                "message": "analyze_age_ensemble 가 dict 를 반환하지 않았습니다.",
+            }
+
+        if "ok" not in result:
+            result["ok"] = False
+            result.setdefault("error", "NO_OK_FIELD")
+
+        return jsonify(result), 200
+
+    except Exception as e:  # 서버에서 발생한 예외를 JSON 으로 래핑
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "SERVER_EXCEPTION",
+                    "message": f"{e.__class__.__name__}: {e}",
+                }
+            ),
+            200,
+        )
 
 
-def run_age_from_base64(image_base64: str) -> Dict[str, Any]:
-    """
-    base64 문자열을 받아 나이를 추정하고
-    결과 딕셔너리 형태로 반환한다.
-    """
-    bgr = decode_base64_to_bgr(image_base64)
-    age_value, extra = predict_age_from_bgr(bgr)
-
-    return {
-        "ok": True,
-        "age": float(age_value),
-        "age_raw": float(age_value),
-        "extra": extra,
-    }
+if __name__ == "__main__":
+    # 로컬 테스트용 (Render 에서는 gunicorn 이 사용됨)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
