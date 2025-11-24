@@ -1,122 +1,207 @@
-import os
+from __future__ import annotations
+
+"""
+age_onnx.py
+
+- age_googlenet.onnx ONNX 모델을 직접 불러서
+  얼굴 나이(대략적인 연령)를 추정하는 모듈.
+- DeepFace / UniFace 전혀 사용하지 않는다.
+"""
+
+from typing import Any, Dict, Tuple
+
+import base64
 import logging
-from typing import Any, Dict
+import os
 
-from flask import Flask, jsonify, request
+import numpy as np
 
-from age_ensemble import analyze_age_ensemble
+try:
+    import cv2  # type: ignore[import]
+except Exception:  # noqa: BLE001
+    cv2 = None  # type: ignore[assignment]
 
-# -----------------------------------------------------------------------------
-# 기본 Flask 앱 설정
-# -----------------------------------------------------------------------------
+try:
+    import onnxruntime as ort  # type: ignore[import]
+except Exception:  # noqa: BLE001
+    ort = None  # type: ignore[assignment]
 
-app = Flask(__name__)
+LOGGER = logging.getLogger("softtech_age_onnx")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
-)
-
-LOGGER = logging.getLogger("softtech_age_api")
-
-
-# -----------------------------------------------------------------------------
-# 헬스 체크
-# -----------------------------------------------------------------------------
+_SESSION: "ort.InferenceSession | None" = None  # type: ignore[name-defined]
+_INPUT_NAME: str | None = None
+_INPUT_SHAPE: Tuple[int, ...] | None = None
 
 
-@app.get("/")
-def index() -> Any:
+def _get_model_path() -> str:
     """
-    Health check + 버전 확인용 엔드포인트.
-    앱에서는 안 써도 되지만, Render 상태 확인용으로 사용.
+    ONNX 모델 경로를 결정한다.
+
+    우선순위:
+      1) 환경변수 AGE_ONNX_MODEL_PATH (파일이 실제 존재할 때만)
+      2) 현재 파일 기준 상대 경로:
+         - models/age_googlenet.onnx
+         - models/age_gender_zoo/age_googlenet.onnx
     """
-    return jsonify(
-        {
-            "ok": True,
-            "service": "SoftTech AgeGoogLeNet Age API",
-            "version": "4-0-age_googlenet-only",
-        }
-    )
+    candidates = []
 
-
-# -----------------------------------------------------------------------------
-# 나이 추정 엔드포인트
-# -----------------------------------------------------------------------------
-
-
-@app.post("/age-ensemble")
-def age_ensemble_route() -> Any:
-    """
-    React Native 앱에서 호출하는 메인 엔드포인트.
-
-    기대 입력(JSON):
-      { "image_base64": "<JPEG base64 문자열>" }
-
-    출력(JSON, HTTP 200 고정):
-      { ok: true, age: number, final_age: number, ... }
-      { ok: false, error: "...", message: "..." }
-    """
-    try:
-        data: Dict[str, Any] | None = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            LOGGER.warning("요청 JSON 파싱 실패: body=%r", request.data[:200])
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "BAD_REQUEST",
-                        "message": "JSON body 가 필요합니다.",
-                    }
-                ),
-                200,
-            )
-
-        image_base64 = data.get("image_base64") or data.get("image")
-        if not image_base64 or not isinstance(image_base64, str):
-            LOGGER.warning("image_base64 필드가 없음 또는 잘못됨: %r", data.keys())
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "MISSING_IMAGE_BASE64",
-                        "message": "image_base64 필드가 필요합니다.",
-                    }
-                ),
-                200,
-            )
-
-        result = analyze_age_ensemble(image_base64=image_base64)
-
-        # analyze_age_ensemble 내부에서 ok / error 모두 처리
-        ok = bool(result.get("ok"))
-        status_code = 200  # 앱 코드가 status != 200 을 에러로 처리하므로 200 고정
-        if ok:
-            LOGGER.info("Age estimate success: %.2f", result.get("final_age", -1.0))
+    env_path = os.getenv("AGE_ONNX_MODEL_PATH")
+    if env_path:
+        # 절대 경로면 그대로, 상대 경로면 이 파일 기준으로 해석
+        if os.path.isabs(env_path):
+            candidates.append(env_path)
         else:
-            LOGGER.warning("Age estimate failed: %s", result.get("error"))
+            base_dir = os.path.dirname(__file__)
+            candidates.append(os.path.join(base_dir, env_path))
 
-        return jsonify(result), status_code
+    base_dir = os.path.dirname(__file__)
+    candidates.append(os.path.join(base_dir, "models", "age_googlenet.onnx"))
+    candidates.append(os.path.join(base_dir, "models", "age_gender_zoo", "age_googlenet.onnx"))
 
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+
+    # 하나도 없으면 후보 목록을 함께 에러로 올려준다.
+    raise FileNotFoundError("ONNX 모델 파일을 찾을 수 없습니다. 시도한 경로들: " + " | ".join(candidates))
+
+
+def _init_session() -> None:
+    """
+    ONNX Runtime 세션을 1회 초기화.
+    """
+    global _SESSION, _INPUT_NAME, _INPUT_SHAPE
+
+    if _SESSION is not None:
+        return
+
+    if ort is None:
+        raise RuntimeError("onnxruntime 이 설치되어 있지 않습니다.")
+
+    if cv2 is None:
+        raise RuntimeError("opencv-python(cv2) 가 설치되어 있지 않습니다.")
+
+    model_path = _get_model_path()
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"ONNX 모델 파일을 찾을 수 없습니다: {model_path}")
+
+    LOGGER.info("Loading ONNX model from %s", model_path)
+    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    _SESSION = sess
+
+    first_input = sess.get_inputs()[0]
+    _INPUT_NAME = first_input.name
+    # 보통 [1, 3, 224, 224] 형태
+    shape = tuple(int(x) if isinstance(x, (int, float)) else -1 for x in first_input.shape)
+    _INPUT_SHAPE = shape  # type: ignore[assignment]
+
+    LOGGER.info("ONNX model input name=%s shape=%s", _INPUT_NAME, _INPUT_SHAPE)
+
+
+def _preprocess_bgr(bgr: "np.ndarray") -> "np.ndarray":  # type: ignore[name-defined]
+    """
+    age_googlenet.onnx 에 맞게 BGR 이미지를 전처리한다.
+
+    - 입력: BGR, uint8, HxWx3
+    - 처리:
+        - 입력 크기 → 모델 입력 크기로 resize
+        - float32 변환
+        - 평균 [104, 117, 123] (BGR) 을 빼고
+        - CHW 로 transpose 후 배치 차원 추가
+    """
+    if _INPUT_SHAPE is None:
+        # 기본값 (1, 3, 224, 224)
+        h, w = 224, 224
+    else:
+        # (N, C, H, W)
+        shape = _INPUT_SHAPE
+        h = int(shape[2]) if len(shape) >= 3 and shape[2] > 0 else 224
+        w = int(shape[3]) if len(shape) >= 4 and shape[3] > 0 else 224
+
+    resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+    arr = resized.astype("float32")
+    mean = np.array([104.0, 117.0, 123.0], dtype="float32")
+    arr -= mean
+    # HWC -> CHW
+    chw = np.transpose(arr, (2, 0, 1))
+    # 배치 차원 추가
+    batched = np.expand_dims(chw, axis=0)
+    return batched
+
+
+def _softmax(logits: "np.ndarray") -> "np.ndarray":  # type: ignore[name-defined]
+    """
+    단순 softmax 구현.
+    """
+    logits = logits.astype("float32")
+    logits = logits - np.max(logits, axis=-1, keepdims=True)
+    exps = np.exp(logits)
+    sums = np.sum(exps, axis=-1, keepdims=True)
+    return exps / np.maximum(sums, 1e-8)
+
+
+def predict_age_from_bgr(bgr: "np.ndarray") -> Tuple[float, Dict[str, Any]]:  # type: ignore[name-defined]
+    """
+    BGR 이미지를 받아서 연령을 추정한다.
+
+    반환:
+      (age_years, extra_info)
+    """
+    _init_session()
+    assert _SESSION is not None
+    assert _INPUT_NAME is not None
+
+    inp = _preprocess_bgr(bgr)
+    outputs = _SESSION.run(None, {_INPUT_NAME: inp})
+
+    if not outputs:
+        raise RuntimeError("ONNX 모델 출력이 비어 있습니다.")
+
+    logits = outputs[0]
+    # 보통 (1, 101) 형태
+    logits = np.array(logits).reshape(1, -1)
+    probs = _softmax(logits)[0]
+
+    ages = np.arange(probs.shape[0], dtype="float32")
+    age_value = float(np.sum(probs * ages))
+
+    extra = {
+        "probs": probs.tolist(),
+        "age_labels": ages.tolist(),
+    }
+    return age_value, extra
+
+
+def decode_base64_to_bgr(image_base64: str) -> "np.ndarray":  # type: ignore[name-defined]
+    """
+    base64 → BGR (OpenCV) 이미지로 변환.
+    """
+    if cv2 is None:
+        raise RuntimeError("opencv-python(cv2) 가 설치되어 있지 않습니다.")
+
+    try:
+        raw = base64.b64decode(image_base64, validate=True)
     except Exception as e:  # noqa: BLE001
-        LOGGER.exception("SERVER_ERROR in /age-ensemble: %s", e)
-        # 여기서도 HTTP 200 으로 내려 보냄 (앱이 status 코드로만 실패 판단하지 않도록)
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "SERVER_ERROR",
-                    "message": f"{e.__class__.__name__}: {e}",
-                }
-            ),
-            200,
-        )
+        raise ValueError(f"BASE64_DECODE_ERROR: {e}") from e
+
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("IMAGE_DECODE_ERROR: cv2.imdecode 실패")
+    return img
 
 
-# -----------------------------------------------------------------------------
+def run_age_from_base64(image_base64: str) -> Dict[str, Any]:
+    """
+    base64 문자열을 받아 나이를 추정하고
+    결과 딕셔너리 형태로 반환한다.
+    """
+    bgr = decode_base64_to_bgr(image_base64)
+    age_value, extra = predict_age_from_bgr(bgr)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    # Render 에서는 gunicorn 이 이 파일을 import 해서 사용하지만,
-    # 로컬 테스트 시에는 python app.py 로 직접 실행 가능.
-    app.run(host="0.0.0.0", port=port, debug=False)
+    return {
+        "ok": True,
+        "age": float(age_value),
+        "age_raw": float(age_value),
+        "extra": extra,
+    }
