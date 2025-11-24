@@ -1,5 +1,6 @@
 flask
 gunicorn
-opencv-python
+opencv-python-headless
 numpy
 onnxruntime
+coloredlogs
