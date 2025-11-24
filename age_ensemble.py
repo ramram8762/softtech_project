@@ -1,129 +1,102 @@
 from __future__ import annotations
-"""
-통합 나이 추정 모듈 (age_googlenet 단독 버전).
 
-- DeepFace / UniFace 는 완전히 제거.
-- age_googlenet.onnx (ONNX Runtime) 결과만 사용해서 "근사치 나이"를 얻는다.
-- 응답 JSON 은 기존 프런트엔드와 최대한 호환되도록
-  `age`, `final_age`, `ages`, `models`, `signature` 필드를 유지한다.
-- 15~60세 범위 내에서만 보이는 나이를 사용하고,
-  60세 근처에서는 최대 15살까지 완만하게 감산하는 튜닝을 적용한다.
-  (이 값은 이후 앱의 16가지 피부 분석 지표로 한 번 더 보정해서
-   최종 "피부 나이"를 만들 수 있다.)
+"""
+age_ensemble.py
+
+- 앱에서 오는 base64 이미지를 받아서
+- ONNX(age_googlenet) 기반으로 근사 나이를 추정하고
+- 클라이언트가 기대하는 JSON 구조로 가공해 반환한다.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+import base64
+
+import numpy as np
+
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None  # type: ignore
 
 from age_onnx import predict_age_onnx
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    """넘어온 값을 안전하게 float 로 변환한다. 실패 시 None."""
+def _decode_base64_image(image_b64: str) -> "np.ndarray":
+    if cv2 is None:
+        raise RuntimeError("opencv-python(cv2) 가 설치되어 있지 않습니다.")
+
+    if not image_b64 or not isinstance(image_b64, str):
+        raise ValueError("image_base64 가 비어있습니다.")
+
     try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:  # noqa: BLE001
-        return None
+        raw = base64.b64decode(image_b64)
+    except Exception as e:  # pragma: no cover
+        raise ValueError(f"base64 디코딩 실패: {e}") from e
+
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("이미지 디코딩(cv2.imdecode) 실패")
+
+    return img
 
 
-def _calibrate_visible_age_15_60(raw: Optional[float]) -> Optional[float]:
+def _calibrate_age(age_raw: float) -> float:
     """
-    15~60 범위 내에서만 '겉보이는 피부 나이'를 보여 주기 위한 튜닝 함수.
-
-    - 입력 나이가 15 미만이면 15로 올려 준다.
-    - 60 초과면 60으로 잘라 준다.
-    - 15~60 구간에서 위로 갈수록 최대 15살까지 조금씩 감소시킨다.
-      (예: 60 → 약 45 부근)
+    간단한 범위 보정:
+    - 0 미만 / NaN / inf → 오류로 간주
+    - 15 ~ 60 범위로 클램핑
     """
-    raw_f = _safe_float(raw)
-    if raw_f is None:
-        return None
+    if not np.isfinite(age_raw):
+        raise ValueError(f"유효하지 않은 나이 값: {age_raw!r}")
 
-    # 기본 범위 클리핑
-    if raw_f < 15.0:
-        raw_f = 15.0
-    if raw_f > 60.0:
-        raw_f = 60.0
+    age = float(age_raw)
+    if age < 0:
+        age = 0.0
 
-    # 15~60 구간을 0~1 로 정규화
-    t = (raw_f - 15.0) / 45.0  # 0~1
-    # t 가 커질수록 더 많이 빼 주되, 60 에서 약 15년 정도 빠지도록
-    subtract = 15.0 * (t ** 1.2)  # 지수 1.2 는 완만한 곡선
-    calibrated = raw_f - subtract
+    # 최소/최대값 보정 (너가 말한 15~60 구간)
+    if age < 15.0:
+        age = 15.0
+    if age > 60.0:
+        age = 60.0
 
-    # 안전 범위 보정
-    if calibrated < 15.0:
-        calibrated = 15.0
-    if calibrated > 60.0:
-        calibrated = 60.0
-
-    return calibrated
+    return age
 
 
-def analyze_age_ensemble(image_base64: str) -> Dict[str, Any]:
+def analyze_age_ensemble(image_b64: str) -> Dict[str, Any]:
     """
-    클라이언트에서 보낸 base64 이미지를 받아
-    age_googlenet.onnx 를 통해 나이를 추정하고,
-    SoftTech 앱에서 사용하는 JSON 포맷으로 감싸서 리턴한다.
+    앱에서 오는 base64 이미지를 받아서
+    나이 추정 결과를 JSON(dict) 로 돌려준다.
     """
-    signature = "SOFTTECH_AGE_GOOGLENET_ONLY_V1"
+    try:
+        img = _decode_base64_image(image_b64)
+        age_raw = predict_age_onnx(img)
+        age_final = _calibrate_age(age_raw)
 
-    base = predict_age_onnx(image_base64)
-    if not base.get("ok"):
-        # ONNX 단계에서 실패한 경우
-        return {
-            "signature": signature,
-            "ok": False,
-            "error": base.get("error") or "AGE_ONNX_ERROR",
-            "age": None,
-            "age_raw": None,
-            "final_age": None,
+        result: Dict[str, Any] = {
+            "ok": True,
+            "signature": "SOFTTECH_AGE_GOOGLENET_ONLY_V1",
+            "age_raw": float(age_raw),
+            "age": float(age_final),
+            "final_age": float(age_final),
+            # 기존 구조를 최대한 유지: ages / gender / models / model_count
+            "ages": {
+                "age_googlenet": float(age_raw),
+            },
             "gender": None,
-            "ages": {},
-            "models": {},
-            "model_count": 0,
+            "model_count": 1,
+            "models": {
+                "age_googlenet": {
+                    "age": float(age_raw),
+                    "confidence": 1.0,
+                }
+            },
         }
-
-    raw_age = base.get("age")
-    age_raw = _safe_float(raw_age)
-    visible_age = _calibrate_visible_age_15_60(age_raw)
-
-    if visible_age is None:
+        return result
+    except Exception as e:
+        # 여기서 발생한 에러는 app.py 에서 HTTP 500 으로 매핑된다.
         return {
-            "signature": signature,
             "ok": False,
-            "error": "AGE_CALIBRATION_FAILED",
-            "age": None,
-            "age_raw": age_raw,
-            "final_age": None,
-            "gender": None,
-            "ages": {},
-            "models": {},
-            "model_count": 0,
+            "error": "AGE_INFERENCE_ERROR",
+            "message": f"{e.__class__.__name__}: {e}",
         }
-
-    ages: Dict[str, float] = {}
-    models: Dict[str, Dict[str, Any]] = {}
-
-    if age_raw is not None:
-        ages["age_googlenet"] = float(age_raw)
-        models["age_googlenet"] = {
-            "age": float(age_raw),
-        }
-
-    return {
-        "signature": signature,
-        "ok": True,
-        "error": None,
-        # age_raw: ONNX 모델이 그대로 뱉은 값 (근사치 얼굴 나이)
-        "age_raw": age_raw,
-        # age / final_age: 15~60 범위 튜닝이 적용된 값
-        "age": visible_age,
-        "final_age": visible_age,
-        # 이제 성별은 사용하지 않으므로 None 으로 둔다.
-        "gender": None,
-        "ages": ages,
-        "models": models,
-        "model_count": len(ages),
-    }
